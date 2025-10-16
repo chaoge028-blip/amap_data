@@ -1,29 +1,35 @@
 import json
 import random
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 import xlwt
 
 # 设置Poi搜索的各项参数
 amap_api_key = '6ba90269c8b50ed3ad54d4e5fc35cfff'  # 输入自己的key
-poi_search_url = 'https://restapi.amap.com/v3/place/text'
+polygon_search_url = 'https://restapi.amap.com/v3/place/polygon'
 district_url = 'https://restapi.amap.com/v3/config/district'
 
 # 设置检索关键词：地区(市) + 公司名称关键词
 city_name = '上海市'
 company_keyword = '物业公司'
 
-# 单个区县最多导出的记录条数（高德官方上限：25 条 × 100 页 = 2500 条）
-MAX_RECORDS_PER_REGION = 2500
+# 单个区县允许导出的最大记录条数（可根据需要调整，None 表示不设上限）
+MAX_RECORDS_PER_REGION: Optional[int] = None
 
 # 每页请求的最大条目数（官方限制）
 PAGE_SIZE = 25
 
 # 官方允许的最大翻页次数
 MAX_PAGES_PER_REGION = 100
+
+# 子区域切片策略
+MIN_CELL_EDGE_DEGREES = 0.01   # 单个小网格的最小经纬度边长
+MAX_CELL_SPLIT_DEPTH = 6       # 最深递归拆分层数（4^6 = 4096 个子区域）
 
 # 请求频率及限流重试相关配置
 BASE_REQUEST_INTERVAL = 0.2   # 每次请求后的基础等待时间（秒）
@@ -42,6 +48,85 @@ DEBUG_LOG_FILE = 'amap_debug.log'
 
 # 复用会话以提升网络请求稳定性
 session = requests.Session()
+
+
+@dataclass
+class BoundingBox:
+    min_lng: float
+    min_lat: float
+    max_lng: float
+    max_lat: float
+
+    def width(self) -> float:
+        return self.max_lng - self.min_lng
+
+    def height(self) -> float:
+        return self.max_lat - self.min_lat
+
+    def can_split(self) -> bool:
+        return self.width() > MIN_CELL_EDGE_DEGREES and self.height() > MIN_CELL_EDGE_DEGREES
+
+    def split(self) -> Tuple['BoundingBox', 'BoundingBox', 'BoundingBox', 'BoundingBox']:
+        mid_lng = (self.min_lng + self.max_lng) / 2
+        mid_lat = (self.min_lat + self.max_lat) / 2
+        return (
+            BoundingBox(self.min_lng, self.min_lat, mid_lng, mid_lat),
+            BoundingBox(mid_lng, self.min_lat, self.max_lng, mid_lat),
+            BoundingBox(self.min_lng, mid_lat, mid_lng, self.max_lat),
+            BoundingBox(mid_lng, mid_lat, self.max_lng, self.max_lat),
+        )
+
+
+def parse_district_bbox(polyline: Optional[str]) -> Optional[BoundingBox]:
+    if not polyline:
+        return None
+
+    min_lng = float('inf')
+    min_lat = float('inf')
+    max_lng = float('-inf')
+    max_lat = float('-inf')
+
+    for segment in polyline.split('|'):
+        for pair in segment.split(';'):
+            if not pair:
+                continue
+            parts = pair.split(',')
+            if len(parts) != 2:
+                continue
+            try:
+                lng = float(parts[0])
+                lat = float(parts[1])
+            except ValueError:
+                continue
+            min_lng = min(min_lng, lng)
+            min_lat = min(min_lat, lat)
+            max_lng = max(max_lng, lng)
+            max_lat = max(max_lat, lat)
+
+    if min_lng == float('inf') or min_lat == float('inf'):
+        return None
+
+    return BoundingBox(min_lng=min_lng, min_lat=min_lat, max_lng=max_lng, max_lat=max_lat)
+
+
+def bbox_to_polygon_string(bbox: BoundingBox) -> str:
+    return (
+        f'{bbox.min_lng:.6f},{bbox.min_lat:.6f};'
+        f'{bbox.max_lng:.6f},{bbox.min_lat:.6f};'
+        f'{bbox.max_lng:.6f},{bbox.max_lat:.6f};'
+        f'{bbox.min_lng:.6f},{bbox.max_lat:.6f};'
+        f'{bbox.min_lng:.6f},{bbox.min_lat:.6f}'
+    )
+
+
+def make_poi_unique_key(poi: Dict[str, str]) -> Tuple[str, ...]:
+    poi_id = poi.get('id')
+    if poi_id:
+        return ('id', poi_id)
+    name = poi.get('name', '').strip()
+    address = poi.get('address', '').strip()
+    location = poi.get('location', '').strip()
+    return ('fallback', name, address, location)
 
 
 def log_debug(message: str) -> None:
@@ -83,7 +168,7 @@ def request_json_with_retry(url: str, params: Dict[str, str], context: str) -> D
             time.sleep(wait_time)
 
 
-def fetch_districts(city: str) -> List[Dict[str, str]]:
+def fetch_districts(city: str) -> List[Dict[str, Any]]:
     """获取指定城市下一级的区县名称列表及其adcode。"""
 
     params = {
@@ -115,61 +200,61 @@ def fetch_districts(city: str) -> List[Dict[str, str]]:
         return []
 
     sub_districts = districts_info[0].get('districts', [])
-    districts: List[Dict[str, str]] = []
+    districts: List[Dict[str, Any]] = []
     for item in sub_districts:
         name = item.get('name')
         adcode = item.get('adcode')
+        bbox = parse_district_bbox(item.get('polyline'))
         if name and adcode:
-            districts.append({'name': name, 'adcode': adcode})
+            districts.append({'name': name, 'adcode': adcode, 'bbox': bbox})
+        elif name and not bbox:
+            log_debug(f'{name}缺少有效的边界信息，跳过bbox计算。')
     return districts
 
 
-def export_pois_for_region(region_name: str, region_adcode: str) -> None:
-    """按区县导出Poi信息。"""
-
-    file_name = f"{city_name}{region_name}{company_keyword}.xls"
-
-    workbook = xlwt.Workbook(encoding='utf-8')
-    worksheet = workbook.add_sheet('Sheet 1')
-
-    worksheet.write(0, 0, '公司名称')
-    worksheet.write(0, 1, '详细地址')
-    worksheet.write(0, 2, '电话')
-
+def fetch_pois_for_polygon(
+    region_name: str,
+    region_adcode: str,
+    cell_index: int,
+    bbox: BoundingBox,
+) -> Tuple[List[Dict[str, Any]], Optional[int], bool]:
+    polygon_param = bbox_to_polygon_string(bbox)
+    cell_label = f'{region_name}子区域{cell_index}'
     page = 1
-    line = 1
-    records_written = 0
     consecutive_errors = 0
     rate_limit_attempts = 0
-    declared_total = None
-    declared_total_logged = False
+    declared_total: Optional[int] = None
+    limit_hit = False
+    collected: List[Dict[str, Any]] = []
+    declared_total_announced = False
 
     while True:
-        params = {
-            'key': amap_api_key,
-            'keywords': company_keyword,
-            'city': region_adcode,
-            'citylimit': 'true',
-            'page': page,
-            'offset': PAGE_SIZE,
-            'output': 'json',
-        }
-        context = f'{region_name}第{page}页'
         if page > MAX_PAGES_PER_REGION:
-            extra = ''
-            if declared_total is not None:
-                extra = f'（接口提示总量约{declared_total}条。）'
+            limit_hit = True
             message = (
-                f'{region_name}已达到高德允许的最大翻页次数（{MAX_PAGES_PER_REGION}页），共写入{records_written}条。{extra}'
+                f'{cell_label}已达到高德允许的最大翻页次数（{MAX_PAGES_PER_REGION}页）。'
             )
             print(message)
             log_debug(message)
             break
+
+        params = {
+            'key': amap_api_key,
+            'keywords': company_keyword,
+            'city': region_adcode,
+            'polygon': polygon_param,
+            'page': page,
+            'offset': PAGE_SIZE,
+            'output': 'json',
+        }
+
+        context = f'{cell_label}第{page}页'
         try:
-            json_dict = request_json_with_retry(poi_search_url, params, context)
+            json_dict = request_json_with_retry(polygon_search_url, params, context)
         except RuntimeError as exc:
-            print(exc)
-            log_debug(f'{context}失败：{exc}')
+            message = f'{context}请求失败：{exc}'
+            print(message)
+            log_debug(message)
             break
 
         status = json_dict.get('status')
@@ -177,11 +262,11 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             info = json_dict.get('info', '未知错误')
             infocode = json_dict.get('infocode', '')
             info_text = str(info)
-            info_upper = info_text.upper()
             infocode_text = f'（代码：{infocode}）' if infocode else ''
+            info_upper = info_text.upper()
 
             if 'INVALID_PAGE' in info_upper:
-                message = f'{region_name}已无更多数据，停止在第{page}页。{info_text}{infocode_text}'
+                message = f'{cell_label}提示无更多数据，停止在第{page}页。{info_text}{infocode_text}'
                 print(message)
                 log_debug(message)
                 break
@@ -196,31 +281,30 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
                     wait_time = sleep_seconds + jitter
                     rate_limit_attempts += 1
                     message = (
-                        f'{region_name}请求受限：{info_text}{infocode_text}，第{rate_limit_attempts}次限流重试，等待{wait_time:.1f}秒。'
+                        f'{cell_label}请求受限：{info_text}{infocode_text}，第{rate_limit_attempts}次限流重试，等待{wait_time:.1f}秒。'
                     )
                     print(message)
                     log_debug(message)
                     time.sleep(wait_time)
                     continue
 
-                message = (
-                    f'{region_name}频率受限达到最大重试次数：{info_text}{infocode_text}，停止获取。'
-                )
+                message = f'{cell_label}频率受限达到最大重试次数：{info_text}{infocode_text}，停止获取。'
                 print(message)
                 log_debug(message)
+                limit_hit = True
                 break
 
             if consecutive_errors < 2:
                 consecutive_errors += 1
                 message = (
-                    f'{region_name}第{page}页请求失败：{info_text}{infocode_text}，第{consecutive_errors}次重试。'
+                    f'{cell_label}请求失败：{info_text}{infocode_text}，第{consecutive_errors}次重试。'
                 )
                 print(message)
                 log_debug(message)
                 time.sleep(1)
                 continue
 
-            message = f'{region_name}连续多次请求失败：{info_text}{infocode_text}，停止获取。'
+            message = f'{cell_label}连续多次请求失败：{info_text}{infocode_text}，停止获取。'
             print(message)
             log_debug(message)
             break
@@ -234,85 +318,126 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
                 declared_total = int(count_str)
             except (TypeError, ValueError):
                 declared_total = None
-
-        if declared_total is not None and not declared_total_logged:
+        if declared_total is not None and not declared_total_announced:
             message = (
-                f'{region_name}高德接口提示的可用数据量约为{declared_total}条，实际获取数量可能受关键词覆盖范围或接口限制影响。'
+                f'{cell_label}接口提示的潜在数据量约为{declared_total}条，实际可获取量可能受关键词与区域切分影响。'
             )
             print(message)
             log_debug(message)
-            declared_total_logged = True
+            declared_total_announced = True
 
         pois = json_dict.get('pois', [])
-
         if not pois:
-            if page == 1:
-                message = f'{region_name}暂无更多数据。'
-                if declared_total is not None:
-                    message += f'（接口提示总量约{declared_total}条。）'
-                print(message)
-                if declared_total is not None and declared_total > records_written:
-                    debug_payload = json.dumps(json_dict, ensure_ascii=False)
-                    log_debug(f'{context}返回空数据但接口提示总量更高，响应内容：{debug_payload}')
-            else:
-                message = f'{region_name}数据获取完成。共写入{records_written}条。'
-                if declared_total is not None:
-                    message += f'（接口提示总量约{declared_total}条。）'
-                print(message)
-                if declared_total is not None and declared_total > records_written:
-                    debug_payload = json.dumps(json_dict, ensure_ascii=False)
-                    log_debug(f'{context}提前结束，响应内容：{debug_payload}')
+            if declared_total is not None and declared_total > len(collected):
+                limit_hit = True
+                payload = json.dumps(json_dict, ensure_ascii=False)
+                log_debug(f'{context}返回空数据但声明数量更大，响应：{payload}')
             break
 
-        page_records = 0
+        print(f'{cell_label}第{page}页获取{len(pois)}条数据。')
+        collected.extend(pois)
+
+        if len(pois) < PAGE_SIZE:
+            break
+
+        page += 1
+        time.sleep(BASE_REQUEST_INTERVAL)
+
+    if declared_total is not None and declared_total > len(collected):
+        limit_hit = True
+        message = (
+            f'{cell_label}累计获取{len(collected)}条，接口提示总量约{declared_total}条，可能仍有剩余数据。'
+        )
+        log_debug(message)
+
+    if len(collected) >= MAX_PAGES_PER_REGION * PAGE_SIZE:
+        limit_hit = True
+
+    return collected, declared_total, limit_hit
+
+
+def export_pois_for_region(region_name: str, region_adcode: str, bbox: Optional[BoundingBox]) -> None:
+    """按区县导出Poi信息，必要时拆分子区域以规避单次查询上限。"""
+
+    if bbox is None:
+        message = f'{region_name}缺少有效边界信息，暂无法按网格拆分检索。'
+        print(message)
+        log_debug(message)
+        return
+
+    file_name = f"{city_name}{region_name}{company_keyword}.xls"
+
+    workbook = xlwt.Workbook(encoding='utf-8')
+    worksheet = workbook.add_sheet('Sheet 1')
+
+    worksheet.write(0, 0, '公司名称')
+    worksheet.write(0, 1, '详细地址')
+    worksheet.write(0, 2, '电话')
+
+    line = 1
+    total_written = 0
+    seen_keys: Set[Tuple[str, ...]] = set()
+    cells = deque([(bbox, 0)])
+    cell_counter = 0
+
+    while cells:
+        cell_bbox, depth = cells.popleft()
+        cell_counter += 1
+        cell_label = f'{region_name}子区域{cell_counter}'
+
+        pois, _declared_total, limit_hit = fetch_pois_for_polygon(
+            region_name,
+            region_adcode,
+            cell_counter,
+            cell_bbox,
+        )
+
+        new_records = 0
         for poi in pois:
-            if records_written >= MAX_RECORDS_PER_REGION:
-                break
+            key = make_poi_unique_key(poi)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             worksheet.write(line, 0, poi.get('name', ''))
             worksheet.write(line, 1, poi.get('address', ''))
             worksheet.write(line, 2, poi.get('tel', ''))
             line += 1
-            records_written += 1
-            page_records += 1
+            total_written += 1
+            new_records += 1
 
-        if page_records:
-            message = f'{region_name}第{page}页写入{page_records}条，累计{records_written}条。'
-            print(message)
-            if declared_total is not None and records_written >= declared_total:
-                log_debug(f'{context}写入后累计达到接口提示总量：{records_written}条。')
+            if MAX_RECORDS_PER_REGION is not None and total_written >= MAX_RECORDS_PER_REGION:
+                break
 
-        if records_written >= MAX_RECORDS_PER_REGION:
-            extra = ''
-            if (
-                declared_total is not None
-                and declared_total > MAX_RECORDS_PER_REGION
-            ):
-                extra = (
-                    f'（接口预估总量约为{declared_total}条，已触及{MAX_RECORDS_PER_REGION}条安全上限。）'
-                )
-            message = f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。{extra}'
+        print(f'{cell_label}写入{new_records}条，累计{total_written}条。')
+
+        if MAX_RECORDS_PER_REGION is not None and total_written >= MAX_RECORDS_PER_REGION:
+            message = (
+                f'{region_name}已达到配置的导出上限（{MAX_RECORDS_PER_REGION}条），提前结束后续子区域抓取。'
+            )
             print(message)
             log_debug(message)
             break
-        if len(pois) < params['offset']:
-            summary = f'{region_name}数据获取完成。共写入{records_written}条。'
-            if declared_total is not None:
-                summary += f'（接口提示总量约{declared_total}条。）'
-            print(summary)
-            if declared_total is not None and declared_total > records_written:
-                debug_payload = json.dumps(json_dict, ensure_ascii=False)
-                log_debug(f'{context}返回数据少于分页大小，响应内容：{debug_payload}')
-            break
 
-        message = f'{region_name}数据正在获取中，请耐心等待。'
-        print(message)
-        page += 1
-        time.sleep(BASE_REQUEST_INTERVAL)
+        if limit_hit and depth < MAX_CELL_SPLIT_DEPTH and cell_bbox.can_split():
+            children = cell_bbox.split()
+            for child in children:
+                cells.append((child, depth + 1))
+            split_msg = (
+                f'{cell_label}结果仍接近接口上限，拆分为{len(children)}个更小子区域继续检索。'
+            )
+            print(split_msg)
+            log_debug(split_msg)
+        elif limit_hit:
+            msg = (
+                f'{cell_label}已达到接口限制，但区域过小或拆分层级过深（当前深度{depth}），无法继续细分。'
+            )
+            print(msg)
+            log_debug(msg)
 
     workbook.save(file_name)
-    message = f'{region_name}文件保存成功：{file_name}'
-    print(message)
-    log_debug(message)
+    summary = f'{region_name}数据导出完成，共写入{total_written}条。文件保存为：{file_name}'
+    print(summary)
+    log_debug(summary)
 
 
 def main() -> None:
@@ -322,7 +447,7 @@ def main() -> None:
         return
 
     for district in districts:
-        export_pois_for_region(district['name'], district['adcode'])
+        export_pois_for_region(district['name'], district['adcode'], district.get('bbox'))
 
     print('所有区县的数据处理完毕。')
 
