@@ -10,8 +10,8 @@ poi_search_url = 'https://restapi.amap.com/v3/place/text'
 district_url = 'https://restapi.amap.com/v3/config/district'
 
 # 设置检索关键词：地区(市) + 公司名称关键词
-city_name = '成都市'
-company_keyword = '广告'
+city_name = '上海市'
+company_keyword = '物业公司'
 
 # 单个区县最多导出的记录条数
 MAX_RECORDS_PER_REGION = 2000
@@ -98,11 +98,12 @@ def export_pois_for_region(region: str) -> None:
             if records_written >= MAX_RECORDS_PER_REGION:
                 print(f'{region}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。')
                 break
-            print(f'{region}数据正在获取中，请耐心等待。')
-            page += 1
             if len(pois) < params['offset']:
                 print(f'{region}数据获取完成。')
                 break
+
+            print(f'{region}数据正在获取中，请耐心等待。')
+            page += 1
         except Exception:
             try:
                 test = requests.get(test_url)
