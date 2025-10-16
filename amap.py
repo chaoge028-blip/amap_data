@@ -168,6 +168,42 @@ def request_json_with_retry(url: str, params: Dict[str, str], context: str) -> D
             time.sleep(wait_time)
 
 
+def fetch_single_district_bbox(keyword: str, label: str) -> Optional[BoundingBox]:
+    """按关键字单独查询行政区划，用于补充缺失的边界框。"""
+
+    params = {
+        'key': amap_api_key,
+        'keywords': keyword,
+        'subdistrict': 0,
+        'extensions': 'all',
+    }
+
+    try:
+        data = request_json_with_retry(district_url, params, f'{label}行政区边界补全')
+    except RuntimeError as exc:
+        message = f'{label}行政区边界补全失败：{exc}'
+        print(message)
+        log_debug(message)
+        return None
+
+    if data.get('status') != '1':
+        info = data.get('info', '未知错误')
+        infocode = data.get('infocode', '')
+        message = f'{label}行政区边界补全失败：{info}'
+        if infocode:
+            message += f'（代码：{infocode}）'
+        print(message)
+        log_debug(message)
+        return None
+
+    for district in data.get('districts', []):
+        bbox = parse_district_bbox(district.get('polyline'))
+        if bbox:
+            return bbox
+
+    return None
+
+
 def fetch_districts(city: str) -> List[Dict[str, Any]]:
     """获取指定城市下一级的区县名称列表及其adcode。"""
 
@@ -205,10 +241,18 @@ def fetch_districts(city: str) -> List[Dict[str, Any]]:
         name = item.get('name')
         adcode = item.get('adcode')
         bbox = parse_district_bbox(item.get('polyline'))
+
+        if not bbox and adcode:
+            bbox = fetch_single_district_bbox(adcode, f'{name or adcode}(adcode)')
+
+        if not bbox and name:
+            bbox = fetch_single_district_bbox(name, f'{name}')
+
         if name and adcode:
+            if bbox is None:
+                log_debug(f'{name}仍缺少有效边界信息，后续检索将无法进行网格拆分。')
             districts.append({'name': name, 'adcode': adcode, 'bbox': bbox})
-        elif name and not bbox:
-            log_debug(f'{name}缺少有效的边界信息，跳过bbox计算。')
+
     return districts
 
 
