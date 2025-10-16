@@ -19,13 +19,46 @@ company_keyword = '物业公司'
 MAX_RECORDS_PER_REGION = 2000
 
 # 请求频率及限流重试相关配置
-BASE_REQUEST_INTERVAL = 0.2  # 每次请求后的基础等待时间（秒）
-RATE_LIMIT_BASE_DELAY = 1.5  # 首次遭遇限流后的等待时间（秒）
-MAX_RATE_LIMIT_DELAY = 60    # 限流情况下的最长等待时间（秒）
-MAX_RATE_LIMIT_RETRIES = 6   # 单页允许的限流重试次数
+BASE_REQUEST_INTERVAL = 0.2   # 每次请求后的基础等待时间（秒）
+RATE_LIMIT_BASE_DELAY = 1.5   # 首次遭遇限流后的等待时间（秒）
+MAX_RATE_LIMIT_DELAY = 60     # 限流情况下的最长等待时间（秒）
+MAX_RATE_LIMIT_RETRIES = 6    # 单页允许的限流重试次数
 
-# 设置爬虫网络链接测试链接
-test_url = 'https://www.baidu.com'
+# 网络错误重试配置
+NETWORK_RETRY_BASE_DELAY = 1.0  # 首次网络异常后的等待时间（秒）
+MAX_NETWORK_RETRY_DELAY = 20    # 网络异常时的最大等待时间（秒）
+MAX_NETWORK_RETRIES = 4         # 网络异常的最大重试次数
+REQUEST_TIMEOUT = 10            # 单次请求的超时时间（秒）
+
+# 复用会话以提升网络请求稳定性
+session = requests.Session()
+
+
+def request_json_with_retry(url: str, params: Dict[str, str], context: str) -> Dict:
+    """带有限次重试机制的 JSON 请求工具。"""
+
+    attempt = 0
+    while True:
+        try:
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return json.loads(response.text)
+        except (requests.RequestException, json.JSONDecodeError) as exc:
+            if attempt >= MAX_NETWORK_RETRIES:
+                raise RuntimeError(f'{context}请求失败：{exc}') from exc
+
+            sleep_seconds = min(
+                NETWORK_RETRY_BASE_DELAY * (2 ** attempt),
+                MAX_NETWORK_RETRY_DELAY,
+            )
+            jitter = random.uniform(0, 0.5 * sleep_seconds)
+            wait_time = sleep_seconds + jitter
+            attempt += 1
+            print(
+                f'{context}请求异常：{exc}，第{attempt}次网络重试，'
+                f'等待{wait_time:.1f}秒后继续。'
+            )
+            time.sleep(wait_time)
 
 
 def fetch_districts(city: str) -> List[Dict[str, str]]:
@@ -39,11 +72,9 @@ def fetch_districts(city: str) -> List[Dict[str, str]]:
     }
 
     try:
-        response = requests.get(district_url, params=params)
-        response.raise_for_status()
-        data = json.loads(response.text)
-    except Exception as exc:  # noqa: BLE001 - 保持简单的异常处理
-        print(f'行政区划信息获取失败：{exc}')
+        data = request_json_with_retry(district_url, params, f'{city}行政区划')
+    except RuntimeError as exc:
+        print(exc)
         return []
 
     if data.get('status') != '1':
@@ -97,91 +128,90 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             'offset': 20,
             'output': 'json',
         }
+        context = f'{region_name}第{page}页'
         try:
-            result = requests.get(poi_search_url, params=params)
-            result.raise_for_status()
-            json_dict = json.loads(result.text)
-            status = json_dict.get('status')
-            if status != '1':
-                info = json_dict.get('info', '未知错误')
-                infocode = json_dict.get('infocode', '')
-                info_text = str(info)
-                info_upper = info_text.upper()
-                infocode_text = f'（代码：{infocode}）' if infocode else ''
+            json_dict = request_json_with_retry(poi_search_url, params, context)
+        except RuntimeError as exc:
+            print(exc)
+            break
 
-                if 'INVALID_PAGE' in info_upper:
-                    print(f'{region_name}已无更多数据，停止在第{page}页。{info_text}{infocode_text}')
-                    break
+        status = json_dict.get('status')
+        if status != '1':
+            info = json_dict.get('info', '未知错误')
+            infocode = json_dict.get('infocode', '')
+            info_text = str(info)
+            info_upper = info_text.upper()
+            infocode_text = f'（代码：{infocode}）' if infocode else ''
 
-                if 'OVER_LIMIT' in info_upper or 'FREQUENT' in info_upper:
-                    if rate_limit_attempts < MAX_RATE_LIMIT_RETRIES:
-                        sleep_seconds = min(
-                            RATE_LIMIT_BASE_DELAY * (2 ** rate_limit_attempts),
-                            MAX_RATE_LIMIT_DELAY,
-                        )
-                        jitter = random.uniform(0, 0.5 * sleep_seconds)
-                        wait_time = sleep_seconds + jitter
-                        rate_limit_attempts += 1
-                        print(
-                            f'{region_name}请求受限：{info_text}{infocode_text}，'
-                            f'第{rate_limit_attempts}次限流重试，等待{wait_time:.1f}秒。'
-                        )
-                        time.sleep(wait_time)
-                        continue
+            if 'INVALID_PAGE' in info_upper:
+                print(f'{region_name}已无更多数据，停止在第{page}页。{info_text}{infocode_text}')
+                break
 
-                    print(
-                        f'{region_name}频率受限达到最大重试次数：{info_text}{infocode_text}，停止获取。'
+            if 'OVER_LIMIT' in info_upper or 'FREQUENT' in info_upper:
+                if rate_limit_attempts < MAX_RATE_LIMIT_RETRIES:
+                    sleep_seconds = min(
+                        RATE_LIMIT_BASE_DELAY * (2 ** rate_limit_attempts),
+                        MAX_RATE_LIMIT_DELAY,
                     )
-                    break
-
-                if consecutive_errors < 2:
-                    consecutive_errors += 1
-                    print(f'{region_name}第{page}页请求失败：{info_text}{infocode_text}，第{consecutive_errors}次重试。')
-                    time.sleep(1)
+                    jitter = random.uniform(0, 0.5 * sleep_seconds)
+                    wait_time = sleep_seconds + jitter
+                    rate_limit_attempts += 1
+                    print(
+                        f'{region_name}请求受限：{info_text}{infocode_text}，'
+                        f'第{rate_limit_attempts}次限流重试，等待{wait_time:.1f}秒。'
+                    )
+                    time.sleep(wait_time)
                     continue
 
-                print(f'{region_name}连续多次请求失败：{info_text}{infocode_text}，停止获取。')
+                print(
+                    f'{region_name}频率受限达到最大重试次数：{info_text}{infocode_text}，停止获取。'
+                )
                 break
 
-            consecutive_errors = 0
-            rate_limit_attempts = 0
-            pois = json_dict.get('pois', [])
+            if consecutive_errors < 2:
+                consecutive_errors += 1
+                print(f'{region_name}第{page}页请求失败：{info_text}{infocode_text}，第{consecutive_errors}次重试。')
+                time.sleep(1)
+                continue
 
-            if not pois:
-                if page == 1:
-                    print(f'{region_name}暂无更多数据。')
-                else:
-                    print(f'{region_name}数据获取完成。')
-                break
+            print(f'{region_name}连续多次请求失败：{info_text}{infocode_text}，停止获取。')
+            break
 
-            for poi in pois:
-                if records_written >= MAX_RECORDS_PER_REGION:
-                    break
-                worksheet.write(line, 0, poi.get('name', ''))
-                worksheet.write(line, 1, poi.get('address', ''))
-                worksheet.write(line, 2, poi.get('tel', ''))
-                line += 1
-                records_written += 1
+        consecutive_errors = 0
+        rate_limit_attempts = 0
+        pois = json_dict.get('pois', [])
 
+        if not pois:
+            if page == 1:
+                print(f'{region_name}暂无更多数据。')
+            else:
+                print(f'{region_name}数据获取完成。共写入{records_written}条。')
+            break
+
+        page_records = 0
+        for poi in pois:
             if records_written >= MAX_RECORDS_PER_REGION:
-                print(f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。')
                 break
-            if len(pois) < params['offset']:
-                print(f'{region_name}数据获取完成。')
-                break
+            worksheet.write(line, 0, poi.get('name', ''))
+            worksheet.write(line, 1, poi.get('address', ''))
+            worksheet.write(line, 2, poi.get('tel', ''))
+            line += 1
+            records_written += 1
+            page_records += 1
 
-            print(f'{region_name}数据正在获取中，请耐心等待。')
-            page += 1
-            time.sleep(BASE_REQUEST_INTERVAL)
-        except Exception:
-            try:
-                test = requests.get(test_url)
-                test.raise_for_status()
-                print(f'{region_name}数据获取完成。')
-                break
-            except Exception:
-                print(f'{region_name}数据获取失败，请检查网络连接。')
-                break
+        if page_records:
+            print(f'{region_name}第{page}页写入{page_records}条，累计{records_written}条。')
+
+        if records_written >= MAX_RECORDS_PER_REGION:
+            print(f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。')
+            break
+        if len(pois) < params['offset']:
+            print(f'{region_name}数据获取完成。共写入{records_written}条。')
+            break
+
+        print(f'{region_name}数据正在获取中，请耐心等待。')
+        page += 1
+        time.sleep(BASE_REQUEST_INTERVAL)
 
     workbook.save(file_name)
     print(f'{region_name}文件保存成功：{file_name}')
