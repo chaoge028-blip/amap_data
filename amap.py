@@ -1,6 +1,7 @@
 import json
 import random
 import time
+from datetime import datetime
 from typing import Dict, List
 
 import requests
@@ -36,8 +37,22 @@ MAX_NETWORK_RETRY_DELAY = 20    # 网络异常时的最大等待时间（秒）
 MAX_NETWORK_RETRIES = 4         # 网络异常的最大重试次数
 REQUEST_TIMEOUT = 10            # 单次请求的超时时间（秒）
 
+# 调试日志文件，用于记录导致数据提前终止的接口返回信息
+DEBUG_LOG_FILE = 'amap_debug.log'
+
 # 复用会话以提升网络请求稳定性
 session = requests.Session()
+
+
+def log_debug(message: str) -> None:
+    """将调试信息追加写入日志文件。"""
+
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(DEBUG_LOG_FILE, 'a', encoding='utf-8') as log_file:
+            log_file.write(f'[{timestamp}] {message}\n')
+    except OSError as exc:
+        print(f'写入调试日志失败：{exc}')
 
 
 def request_json_with_retry(url: str, params: Dict[str, str], context: str) -> Dict:
@@ -60,10 +75,11 @@ def request_json_with_retry(url: str, params: Dict[str, str], context: str) -> D
             jitter = random.uniform(0, 0.5 * sleep_seconds)
             wait_time = sleep_seconds + jitter
             attempt += 1
-            print(
-                f'{context}请求异常：{exc}，第{attempt}次网络重试，'
-                f'等待{wait_time:.1f}秒后继续。'
+            message = (
+                f'{context}请求异常：{exc}，第{attempt}次网络重试，等待{wait_time:.1f}秒后继续。'
             )
+            print(message)
+            log_debug(message)
             time.sleep(wait_time)
 
 
@@ -81,6 +97,7 @@ def fetch_districts(city: str) -> List[Dict[str, str]]:
         data = request_json_with_retry(district_url, params, f'{city}行政区划')
     except RuntimeError as exc:
         print(exc)
+        log_debug(f'{city}行政区划请求失败：{exc}')
         return []
 
     if data.get('status') != '1':
@@ -90,6 +107,7 @@ def fetch_districts(city: str) -> List[Dict[str, str]]:
         if infocode:
             message += f'（代码：{infocode}）'
         print(message)
+        log_debug(message)
         return []
 
     districts_info = data.get('districts', [])
@@ -141,15 +159,17 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             extra = ''
             if declared_total is not None:
                 extra = f'（接口提示总量约{declared_total}条。）'
-            print(
-                f'{region_name}已达到高德允许的最大翻页次数（{MAX_PAGES_PER_REGION}页），'
-                f'共写入{records_written}条。{extra}'
+            message = (
+                f'{region_name}已达到高德允许的最大翻页次数（{MAX_PAGES_PER_REGION}页），共写入{records_written}条。{extra}'
             )
+            print(message)
+            log_debug(message)
             break
         try:
             json_dict = request_json_with_retry(poi_search_url, params, context)
         except RuntimeError as exc:
             print(exc)
+            log_debug(f'{context}失败：{exc}')
             break
 
         status = json_dict.get('status')
@@ -161,7 +181,9 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             infocode_text = f'（代码：{infocode}）' if infocode else ''
 
             if 'INVALID_PAGE' in info_upper:
-                print(f'{region_name}已无更多数据，停止在第{page}页。{info_text}{infocode_text}')
+                message = f'{region_name}已无更多数据，停止在第{page}页。{info_text}{infocode_text}'
+                print(message)
+                log_debug(message)
                 break
 
             if 'OVER_LIMIT' in info_upper or 'FREQUENT' in info_upper:
@@ -173,25 +195,34 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
                     jitter = random.uniform(0, 0.5 * sleep_seconds)
                     wait_time = sleep_seconds + jitter
                     rate_limit_attempts += 1
-                    print(
-                        f'{region_name}请求受限：{info_text}{infocode_text}，'
-                        f'第{rate_limit_attempts}次限流重试，等待{wait_time:.1f}秒。'
+                    message = (
+                        f'{region_name}请求受限：{info_text}{infocode_text}，第{rate_limit_attempts}次限流重试，等待{wait_time:.1f}秒。'
                     )
+                    print(message)
+                    log_debug(message)
                     time.sleep(wait_time)
                     continue
 
-                print(
+                message = (
                     f'{region_name}频率受限达到最大重试次数：{info_text}{infocode_text}，停止获取。'
                 )
+                print(message)
+                log_debug(message)
                 break
 
             if consecutive_errors < 2:
                 consecutive_errors += 1
-                print(f'{region_name}第{page}页请求失败：{info_text}{infocode_text}，第{consecutive_errors}次重试。')
+                message = (
+                    f'{region_name}第{page}页请求失败：{info_text}{infocode_text}，第{consecutive_errors}次重试。'
+                )
+                print(message)
+                log_debug(message)
                 time.sleep(1)
                 continue
 
-            print(f'{region_name}连续多次请求失败：{info_text}{infocode_text}，停止获取。')
+            message = f'{region_name}连续多次请求失败：{info_text}{infocode_text}，停止获取。'
+            print(message)
+            log_debug(message)
             break
 
         consecutive_errors = 0
@@ -205,10 +236,11 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
                 declared_total = None
 
         if declared_total is not None and not declared_total_logged:
-            print(
-                f'{region_name}高德接口提示的可用数据量约为{declared_total}条，'
-                '实际获取数量可能受关键词覆盖范围或接口限制影响。'
+            message = (
+                f'{region_name}高德接口提示的可用数据量约为{declared_total}条，实际获取数量可能受关键词覆盖范围或接口限制影响。'
             )
+            print(message)
+            log_debug(message)
             declared_total_logged = True
 
         pois = json_dict.get('pois', [])
@@ -219,11 +251,17 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
                 if declared_total is not None:
                     message += f'（接口提示总量约{declared_total}条。）'
                 print(message)
+                if declared_total is not None and declared_total > records_written:
+                    debug_payload = json.dumps(json_dict, ensure_ascii=False)
+                    log_debug(f'{context}返回空数据但接口提示总量更高，响应内容：{debug_payload}')
             else:
                 message = f'{region_name}数据获取完成。共写入{records_written}条。'
                 if declared_total is not None:
                     message += f'（接口提示总量约{declared_total}条。）'
                 print(message)
+                if declared_total is not None and declared_total > records_written:
+                    debug_payload = json.dumps(json_dict, ensure_ascii=False)
+                    log_debug(f'{context}提前结束，响应内容：{debug_payload}')
             break
 
         page_records = 0
@@ -238,7 +276,10 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             page_records += 1
 
         if page_records:
-            print(f'{region_name}第{page}页写入{page_records}条，累计{records_written}条。')
+            message = f'{region_name}第{page}页写入{page_records}条，累计{records_written}条。'
+            print(message)
+            if declared_total is not None and records_written >= declared_total:
+                log_debug(f'{context}写入后累计达到接口提示总量：{records_written}条。')
 
         if records_written >= MAX_RECORDS_PER_REGION:
             extra = ''
@@ -249,21 +290,29 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
                 extra = (
                     f'（接口预估总量约为{declared_total}条，已触及{MAX_RECORDS_PER_REGION}条安全上限。）'
                 )
-            print(f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。{extra}')
+            message = f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。{extra}'
+            print(message)
+            log_debug(message)
             break
         if len(pois) < params['offset']:
             summary = f'{region_name}数据获取完成。共写入{records_written}条。'
             if declared_total is not None:
                 summary += f'（接口提示总量约{declared_total}条。）'
             print(summary)
+            if declared_total is not None and declared_total > records_written:
+                debug_payload = json.dumps(json_dict, ensure_ascii=False)
+                log_debug(f'{context}返回数据少于分页大小，响应内容：{debug_payload}')
             break
 
-        print(f'{region_name}数据正在获取中，请耐心等待。')
+        message = f'{region_name}数据正在获取中，请耐心等待。'
+        print(message)
         page += 1
         time.sleep(BASE_REQUEST_INTERVAL)
 
     workbook.save(file_name)
-    print(f'{region_name}文件保存成功：{file_name}')
+    message = f'{region_name}文件保存成功：{file_name}'
+    print(message)
+    log_debug(message)
 
 
 def main() -> None:
