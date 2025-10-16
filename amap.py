@@ -1,4 +1,5 @@
 import json
+from math import ceil
 from typing import List
 
 import requests
@@ -12,6 +13,9 @@ district_url = 'https://restapi.amap.com/v3/config/district'
 # 设置检索关键词：地区(市) + 公司名称关键词
 city_name = '成都市'
 company_keyword = '广告'
+
+# 单个区县最多导出的记录条数
+MAX_RECORDS_PER_REGION = 2000
 
 # 设置爬虫网络链接测试链接
 test_url = 'https://www.baidu.com'
@@ -59,8 +63,10 @@ def export_pois_for_region(region: str) -> None:
 
     page = 1
     line = 1
+    total_pages = None
+    records_written = 0
 
-    while page <= 100:
+    while True:
         params = {
             'key': amap_api_key,
             'keywords': search_keyword,
@@ -75,6 +81,15 @@ def export_pois_for_region(region: str) -> None:
             json_dict = json.loads(result.text)
             pois = json_dict.get('pois', [])
 
+            if total_pages is None:
+                try:
+                    total_count = int(json_dict.get('count', '0') or 0)
+                except ValueError:
+                    total_count = 0
+                if total_count > 0:
+                    total_count = min(total_count, MAX_RECORDS_PER_REGION)
+                    total_pages = ceil(total_count / params['offset'])
+
             if not pois:
                 if page == 1:
                     print(f'{region}暂无更多数据。')
@@ -83,13 +98,22 @@ def export_pois_for_region(region: str) -> None:
                 break
 
             for poi in pois:
+                if records_written >= MAX_RECORDS_PER_REGION:
+                    break
                 worksheet.write(line, 0, poi.get('name', ''))
                 worksheet.write(line, 1, poi.get('address', ''))
                 worksheet.write(line, 2, poi.get('tel', ''))
                 line += 1
+                records_written += 1
 
+            if records_written >= MAX_RECORDS_PER_REGION:
+                print(f'{region}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。')
+                break
             print(f'{region}数据正在获取中，请耐心等待。')
             page += 1
+            if total_pages is not None and page > total_pages:
+                print(f'{region}数据获取完成。')
+                break
         except Exception:
             try:
                 test = requests.get(test_url)
