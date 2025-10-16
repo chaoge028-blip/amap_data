@@ -15,8 +15,14 @@ district_url = 'https://restapi.amap.com/v3/config/district'
 city_name = '上海市'
 company_keyword = '物业公司'
 
-# 单个区县最多导出的记录条数
-MAX_RECORDS_PER_REGION = 2000
+# 单个区县最多导出的记录条数（高德官方上限：25 条 × 100 页 = 2500 条）
+MAX_RECORDS_PER_REGION = 2500
+
+# 每页请求的最大条目数（官方限制）
+PAGE_SIZE = 25
+
+# 官方允许的最大翻页次数
+MAX_PAGES_PER_REGION = 100
 
 # 请求频率及限流重试相关配置
 BASE_REQUEST_INTERVAL = 0.2   # 每次请求后的基础等待时间（秒）
@@ -125,10 +131,16 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             'city': region_adcode,
             'citylimit': 'true',
             'page': page,
-            'offset': 20,
+            'offset': PAGE_SIZE,
             'output': 'json',
         }
         context = f'{region_name}第{page}页'
+        if page > MAX_PAGES_PER_REGION:
+            print(
+                f'{region_name}已达到高德允许的最大翻页次数（{MAX_PAGES_PER_REGION}页），'
+                f'共写入{records_written}条。'
+            )
+            break
         try:
             json_dict = request_json_with_retry(poi_search_url, params, context)
         except RuntimeError as exc:
