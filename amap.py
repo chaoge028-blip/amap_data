@@ -8,8 +8,8 @@ amap_api_key = '6ba90269c8b50ed3ad54d4e5fc35cfff'  # 输入自己的key
 poi_search_url = 'https://restapi.amap.com/v3/place/text'
 
 # 设置检索关键词：地区 + 公司名称关键词
-region_keyword = '上海'
-company_keyword = '物业公司'
+region_keyword = '成都市双流区'
+company_keyword = '广告'
 search_keyword = f"{region_keyword}{company_keyword}"
 
 # 设置爬虫网络链接测试链接
