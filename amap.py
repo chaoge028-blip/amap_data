@@ -123,6 +123,8 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
     records_written = 0
     consecutive_errors = 0
     rate_limit_attempts = 0
+    declared_total = None
+    declared_total_logged = False
 
     while True:
         params = {
@@ -136,9 +138,12 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
         }
         context = f'{region_name}第{page}页'
         if page > MAX_PAGES_PER_REGION:
+            extra = ''
+            if declared_total is not None:
+                extra = f'（接口提示总量约{declared_total}条。）'
             print(
                 f'{region_name}已达到高德允许的最大翻页次数（{MAX_PAGES_PER_REGION}页），'
-                f'共写入{records_written}条。'
+                f'共写入{records_written}条。{extra}'
             )
             break
         try:
@@ -191,13 +196,34 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
 
         consecutive_errors = 0
         rate_limit_attempts = 0
+
+        if declared_total is None:
+            count_str = json_dict.get('count')
+            try:
+                declared_total = int(count_str)
+            except (TypeError, ValueError):
+                declared_total = None
+
+        if declared_total is not None and not declared_total_logged:
+            print(
+                f'{region_name}高德接口提示的可用数据量约为{declared_total}条，'
+                '实际获取数量可能受关键词覆盖范围或接口限制影响。'
+            )
+            declared_total_logged = True
+
         pois = json_dict.get('pois', [])
 
         if not pois:
             if page == 1:
-                print(f'{region_name}暂无更多数据。')
+                message = f'{region_name}暂无更多数据。'
+                if declared_total is not None:
+                    message += f'（接口提示总量约{declared_total}条。）'
+                print(message)
             else:
-                print(f'{region_name}数据获取完成。共写入{records_written}条。')
+                message = f'{region_name}数据获取完成。共写入{records_written}条。'
+                if declared_total is not None:
+                    message += f'（接口提示总量约{declared_total}条。）'
+                print(message)
             break
 
         page_records = 0
@@ -215,10 +241,21 @@ def export_pois_for_region(region_name: str, region_adcode: str) -> None:
             print(f'{region_name}第{page}页写入{page_records}条，累计{records_written}条。')
 
         if records_written >= MAX_RECORDS_PER_REGION:
-            print(f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。')
+            extra = ''
+            if (
+                declared_total is not None
+                and declared_total > MAX_RECORDS_PER_REGION
+            ):
+                extra = (
+                    f'（接口预估总量约为{declared_total}条，已触及{MAX_RECORDS_PER_REGION}条安全上限。）'
+                )
+            print(f'{region_name}已达到{MAX_RECORDS_PER_REGION}条上限，停止继续获取。{extra}')
             break
         if len(pois) < params['offset']:
-            print(f'{region_name}数据获取完成。共写入{records_written}条。')
+            summary = f'{region_name}数据获取完成。共写入{records_written}条。'
+            if declared_total is not None:
+                summary += f'（接口提示总量约{declared_total}条。）'
+            print(summary)
             break
 
         print(f'{region_name}数据正在获取中，请耐心等待。')
