@@ -3,7 +3,7 @@ import json
 import xlwt
 
 # 设置Poi搜索的各项参数
-amap_api_key = ''  # 输入自己的key
+amap_api_key = '6ba90269c8b50ed3ad54d4e5fc35cfff'  # 输入自己的key
 poi_search_url = 'https://restapi.amap.com/v3/place/around?'
 location = '121.459126,31.162659'
 radius = '1500'
