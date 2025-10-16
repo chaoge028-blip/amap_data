@@ -21,6 +21,9 @@ company_keyword = '广告'
 # 单个区县允许导出的最大记录条数（可根据需要调整，None 表示不设上限）
 MAX_RECORDS_PER_REGION: Optional[int] = None
 
+# 若仅需导出指定区县，可在此列出目标名称或 adcode；为空列表时默认导出城市下全部区县
+TARGET_DISTRICTS: List[str] = []
+
 # 每页请求的最大条目数（官方限制）
 PAGE_SIZE = 25
 
@@ -168,8 +171,8 @@ def request_json_with_retry(url: str, params: Dict[str, str], context: str) -> D
             time.sleep(wait_time)
 
 
-def fetch_single_district_bbox(keyword: str, label: str) -> Optional[BoundingBox]:
-    """按关键字单独查询行政区划，用于补充缺失的边界框。"""
+def fetch_single_district_details(keyword: str, label: str) -> Optional[Dict[str, Any]]:
+    """按关键字单独查询行政区划信息，用于补充缺失的边界框或独立检索。"""
 
     params = {
         'key': amap_api_key,
@@ -179,9 +182,9 @@ def fetch_single_district_bbox(keyword: str, label: str) -> Optional[BoundingBox
     }
 
     try:
-        data = request_json_with_retry(district_url, params, f'{label}行政区边界补全')
+        data = request_json_with_retry(district_url, params, f'{label}行政区信息补全')
     except RuntimeError as exc:
-        message = f'{label}行政区边界补全失败：{exc}'
+        message = f'{label}行政区信息补全失败：{exc}'
         print(message)
         log_debug(message)
         return None
@@ -189,7 +192,7 @@ def fetch_single_district_bbox(keyword: str, label: str) -> Optional[BoundingBox
     if data.get('status') != '1':
         info = data.get('info', '未知错误')
         infocode = data.get('infocode', '')
-        message = f'{label}行政区边界补全失败：{info}'
+        message = f'{label}行政区信息补全失败：{info}'
         if infocode:
             message += f'（代码：{infocode}）'
         print(message)
@@ -198,8 +201,12 @@ def fetch_single_district_bbox(keyword: str, label: str) -> Optional[BoundingBox
 
     for district in data.get('districts', []):
         bbox = parse_district_bbox(district.get('polyline'))
-        if bbox:
-            return bbox
+        name = district.get('name') or label
+        adcode = district.get('adcode')
+        if adcode:
+            if bbox is None:
+                log_debug(f'{name}行政区信息补全缺少边界数据，后续检索可能无法拆分网格。')
+            return {'name': name, 'adcode': adcode, 'bbox': bbox}
 
     return None
 
@@ -243,10 +250,17 @@ def fetch_districts(city: str) -> List[Dict[str, Any]]:
         bbox = parse_district_bbox(item.get('polyline'))
 
         if not bbox and adcode:
-            bbox = fetch_single_district_bbox(adcode, f'{name or adcode}(adcode)')
+            details = fetch_single_district_details(adcode, f'{name or adcode}(adcode)')
+            if details:
+                bbox = details.get('bbox')
+                name = name or details.get('name')
+                adcode = details.get('adcode', adcode)
 
         if not bbox and name:
-            bbox = fetch_single_district_bbox(name, f'{name}')
+            details = fetch_single_district_details(name, f'{name}')
+            if details:
+                bbox = details.get('bbox')
+                adcode = details.get('adcode', adcode)
 
         if name and adcode:
             if bbox is None:
@@ -489,6 +503,55 @@ def main() -> None:
     if not districts:
         print('未获取到区县信息，请检查城市名称或网络连接。')
         return
+
+    if TARGET_DISTRICTS:
+        desired: List[Dict[str, Any]] = []
+        seen_codes: Set[str] = set()
+        name_map = {item['name']: item for item in districts if item.get('name')}
+        code_map = {item['adcode']: item for item in districts if item.get('adcode')}
+
+        for target in TARGET_DISTRICTS:
+            keyword = target.strip()
+            if not keyword:
+                continue
+
+            candidate = name_map.get(keyword) or code_map.get(keyword)
+            if candidate:
+                adcode = candidate['adcode']
+                if adcode in seen_codes:
+                    continue
+                bbox = candidate.get('bbox')
+                if bbox is None:
+                    details = fetch_single_district_details(adcode, f"{candidate['name']}(adcode)")
+                    if not details and candidate.get('name'):
+                        details = fetch_single_district_details(candidate['name'], candidate['name'])
+                    if details:
+                        bbox = details.get('bbox')
+                seen_codes.add(adcode)
+                desired.append({
+                    'name': candidate['name'],
+                    'adcode': adcode,
+                    'bbox': bbox,
+                })
+                continue
+
+            details = fetch_single_district_details(keyword, keyword)
+            if details:
+                adcode = details['adcode']
+                if adcode in seen_codes:
+                    continue
+                seen_codes.add(adcode)
+                desired.append(details)
+            else:
+                message = f'未能获取{keyword}的行政区信息，请确认名称或adcode是否正确。'
+                print(message)
+                log_debug(message)
+
+        if not desired:
+            print('未匹配到任何目标区县，程序结束。')
+            return
+
+        districts = desired
 
     for district in districts:
         export_pois_for_region(district['name'], district['adcode'], district.get('bbox'))
