@@ -10,8 +10,8 @@ poi_search_url = 'https://restapi.amap.com/v3/place/text'
 district_url = 'https://restapi.amap.com/v3/config/district'
 
 # 设置检索关键词：地区(市) + 公司名称关键词
-city_name = '上海市'
-company_keyword = '物业公司'
+city_name = '成都市'
+company_keyword = '广告'
 
 # 设置爬虫网络链接测试链接
 test_url = 'https://www.baidu.com'
