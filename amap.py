@@ -15,8 +15,8 @@ polygon_search_url = 'https://restapi.amap.com/v3/place/polygon'
 district_url = 'https://restapi.amap.com/v3/config/district'
 
 # 设置检索关键词：地区(市) + 公司名称关键词
-city_name = '上海市'
-company_keyword = '物业公司'
+city_name = '成都市'
+company_keyword = '广告'
 
 # 单个区县允许导出的最大记录条数（可根据需要调整，None 表示不设上限）
 MAX_RECORDS_PER_REGION: Optional[int] = None
